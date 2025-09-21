@@ -17,39 +17,44 @@ RTC_DS3231 rtc;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ตัวแปรสำหรับสถานะ
-bool scheduledEventOccurred = false; // สถานะสำหรับป้องกันการทำงานซ้ำซ้อนของกำหนดการ
+bool scheduledEventOccurred = false;
 unsigned long touchStartTime = 0;
-const unsigned long touchDuration = 5000; // ระยะเวลาในการกดค้างเพื่อเรียกใช้ฟังก์ชันควบคุมทั้งหมด (5 วินาที)
+const unsigned long touchDuration = 5000;
 bool isTouching = false;
-bool isFunctionExecuted = false; // สถานะเพื่อควบคุมการทำงานของฟังก์ชันหลังจากกดค้าง
+bool isFunctionExecuted = false;
 unsigned long lastDisplayUpdateTime = 0;
-const unsigned long displayUpdateInterval = 1000; // อัปเดตหน้าจอทุก 1 วินาที
-bool isCountingDown = false; // สถานะสำหรับการแสดงการนับถอยหลังบนหน้าจอ
+const unsigned long displayUpdateInterval = 1000;
+bool isCountingDown = false;
 
 // ตัวแปรสำหรับ Buzzer Alert 30 วินาที
 unsigned long buzzerAlertStartTime = 0;
 bool isBuzzerAlertActive = false;
 unsigned long lastBuzzerToggleTime = 0;
-const unsigned int buzzerInterval = 200; // สลับสถานะ Buzzer ทุกๆ 200ms
+const unsigned int buzzerInterval = 200;
 
-// ตัวแปรสำหรับ Buzzer เมื่อกดปุ่ม (ปรับใหม่)
+// ตัวแปรสำหรับ Buzzer เมื่อกดปุ่ม
 bool isTouchBuzzerActive = false;
 unsigned long lastBuzzerPulseTime = 0;
-const unsigned int pulseOnTime = 50; // ระยะเวลาเปิด Buzzer เมื่อกดปุ่ม
-const unsigned int pulseOffTime = 950; // ระยะเวลาปิด Buzzer เมื่อกดปุ่ม
+const unsigned int pulseOnTime = 50;
+const unsigned int pulseOffTime = 950;
 bool buzzerOnState = false;
 
 // ตัวแปรสำหรับฟังก์ชัน Reset
 unsigned long lastPressTime = 0;
 int pressCount = 0;
-const unsigned long rapidPressTimeout = 500; // ระยะเวลาสูงสุดระหว่างการกดแต่ละครั้ง (500ms)
+const unsigned long rapidPressTimeout = 500;
+
+// ตัวแปรควบคุม Relay แบบ Non-blocking
+unsigned long relayControlStartTime = 0;
+int controlState = 0; // 0=Idle, 1=ControlAll, 2=ControlRelay1, 3=ControlRelay2, 4=ControlRelay3
+int controlStep = 0;
 
 // ประกาศฟังก์ชัน
-void controlAll();
-void controlRelay1();
-void controlRelay2();
-void controlRelay3();
-void controlOff();
+void handleNonBlockingControl();
+void startControlAll();
+void startControlRelay1();
+void startControlRelay2();
+void startControlRelay3();
 void shortBuzzerAlert();
 void handleBuzzerAlert();
 void print2Digits(int number);
@@ -63,56 +68,51 @@ void resetSystem();
 void setup() {
   Serial.begin(115200);
   
-  // กำหนดโหมดของขาพิน
   pinMode(LED1_PIN, OUTPUT);
   pinMode(LED2_PIN, OUTPUT);
   pinMode(LED3_PIN, OUTPUT);
   pinMode(RELAY1_PIN, OUTPUT);
   pinMode(RELAY2_PIN, OUTPUT);
   pinMode(RELAY3_PIN, OUTPUT);
-  pinMode(TOUCH_SENSOR_PIN, INPUT_PULLUP); // ตั้งค่า Touch Sensor เป็น Input Pull-up
+  pinMode(TOUCH_SENSOR_PIN, INPUT_PULLUP);
   pinMode(BUZZER_PIN, OUTPUT);
 
-  // ตั้งค่าสถานะเริ่มต้นของอุปกรณ์ทั้งหมดให้เป็น LOW/HIGH
   digitalWrite(LED1_PIN, LOW);
   digitalWrite(LED2_PIN, LOW);
   digitalWrite(LED3_PIN, LOW);
-  digitalWrite(RELAY1_PIN, HIGH); // RELAY แบบ NC (Normally Closed) ตั้งค่า HIGH เพื่อปิดวงจร
+  digitalWrite(RELAY1_PIN, HIGH);
   digitalWrite(RELAY2_PIN, HIGH);
   digitalWrite(RELAY3_PIN, HIGH);
   digitalWrite(BUZZER_PIN, LOW);
 
-  // เริ่มต้นใช้งาน LCD
   lcd.init();
   lcd.backlight();
   lcd.clear();
   
-  // แสดงหน้าจอ Welcome ตอนเริ่มต้น
   lcd.setCursor(4, 0);
   lcd.print("Welcome!");
   lcd.setCursor(0, 1);
   lcd.print("Smart Control");
-  delay(2000); // แสดงหน้าจอนี้เป็นเวลา 2 วินาที
+  delay(2000);
   lcd.clear();
 
-  // ตรวจสอบการเชื่อมต่อกับโมดูล RTC
   if (!rtc.begin()) {
     lcd.setCursor(0, 1);
     lcd.print("RTC Error!");
     while (1);
   }
 
-  // **** ส่วนสำหรับตั้งเวลา RTC ****
-  // **** แก้ไขเวลาในบรรทัดนี้โดยอิงจากเวลาคอมที่ใช้ในการอัปโหลด ****
-  rtc.adjust(DateTime(F(__DATE__), F(__TIME__))); 
+  // **** ตั้งเวลา RTC เพียงครั้งเดียว! หลังจากนั้นคอมเมนต์บรรทัดนี้ออก ****
+  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   // *************************************************
+
   Serial.println("ระบบพร้อมใช้งาน");
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  // อัปเดตหน้าจอ LCD เฉพาะเมื่อไม่ได้อยู่ในโหมดนับถอยหลังหรือแจ้งเตือน
+  // อัปเดตหน้าจอ LCD
   if (!isCountingDown && !isBuzzerAlertActive && currentMillis - lastDisplayUpdateTime >= displayUpdateInterval) {
     updateDisplay();
     lastDisplayUpdateTime = currentMillis;
@@ -143,23 +143,26 @@ void loop() {
   if (now.second() == 0) {
     if (now.hour() == 8 && now.minute() == 0) {
       if (!scheduledEventOccurred) {
-        controlRelay1();
+        startControlRelay1();
         scheduledEventOccurred = true;
       }
     } else if (now.hour() == 11 && now.minute() == 54) {
       if (!scheduledEventOccurred) {
-        controlRelay2();
+        startControlRelay2();
         scheduledEventOccurred = true;
       }
     } else if (now.hour() == 16 && now.minute() == 0) {
       if (!scheduledEventOccurred) {
-        controlRelay3();
+        startControlRelay3();
         scheduledEventOccurred = true;
       }
     } else {
-      scheduledEventOccurred = false; // รีเซ็ตสถานะเมื่อผ่านเวลาที่กำหนดแล้ว
+      scheduledEventOccurred = false;
     }
   }
+
+  // จัดการการควบคุมแบบ Non-blocking
+  handleNonBlockingControl();
 
   handleTouch();
 }
@@ -168,7 +171,6 @@ void loop() {
 void handleBuzzerAlert() {
   unsigned long currentMillis = millis();
   
-  // ตรวจสอบว่าครบ 30 วินาทีหรือยัง
   if (currentMillis - buzzerAlertStartTime >= 30000) {
     isBuzzerAlertActive = false;
     digitalWrite(BUZZER_PIN, LOW);
@@ -176,7 +178,6 @@ void handleBuzzerAlert() {
     return;
   }
   
-  // สลับสถานะ Buzzer ทุกๆ 200ms
   if (currentMillis - lastBuzzerToggleTime >= buzzerInterval) {
     digitalWrite(BUZZER_PIN, !digitalRead(BUZZER_PIN));
     lastBuzzerToggleTime = currentMillis;
@@ -205,7 +206,6 @@ void handleTouchBuzzer() {
 void handleTouch() {
   if (digitalRead(TOUCH_SENSOR_PIN) == LOW) {
     if (!isTouching) {
-      // ตรวจจับการกดปุ่มเพื่อรีเซ็ต
       unsigned long currentTime = millis();
       if (currentTime - lastPressTime < rapidPressTimeout) {
         pressCount++;
@@ -213,8 +213,8 @@ void handleTouch() {
         Serial.println(pressCount);
         if (pressCount >= 3) {
           resetSystem();
-          lastPressTime = currentTime; 
-          pressCount = 0; 
+          lastPressTime = currentTime;
+          pressCount = 0;
           return;
         }
       } else {
@@ -233,11 +233,10 @@ void handleTouch() {
     
     showCountdown();
 
-    // ตรวจสอบการกดค้างเกิน 5 วินาที
     if ((millis() - touchStartTime) >= touchDuration && !isFunctionExecuted) {
       isTouchBuzzerActive = false;
       digitalWrite(BUZZER_PIN, LOW);
-      controlAll(); // เรียกใช้ฟังก์ชันควบคุมทั้งหมด
+      startControlAll();
       isFunctionExecuted = true;
       isCountingDown = false;
     }
@@ -263,10 +262,9 @@ void showCountdown() {
   lcd.setCursor(0, 0);
   lcd.print("Countdown: "); 
   
-  // แสดงผลบนบรรทัดที่ 2
   lcd.setCursor(0, 1);
   lcd.print(countdownValue); 
-  lcd.print("s "); // เพิ่ม space ด้านหลังเพื่อลบตัวอักษรเก่า
+  lcd.print("s ");
 }
 
 // ส่งสัญญาณ Buzzer สั้นๆ 3 ครั้ง
@@ -279,100 +277,162 @@ void shortBuzzerAlert() {
   }
 }
 
-// ควบคุมการทำงานของ Relay และ LED ทั้งหมดเมื่อกดค้าง 5 วินาที
-void controlAll() {
-  Serial.println("สัมผัสครบ 5 วินาที");
-  digitalWrite(BUZZER_PIN, HIGH);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Devices ON");
-  delay(1000); 
-  digitalWrite(BUZZER_PIN, LOW);
+// ฟังก์ชันเริ่มต้นการควบคุมทั้งหมดแบบ Non-blocking
+void startControlAll() {
+  Serial.println("Starting all relays non-blocking...");
+  relayControlStartTime = millis();
+  controlState = 1; // สถานะ Control All
+  controlStep = 0;
+}
 
-  // ควบคุม Relay 1 และ LED 1
-  Serial.println("BOX 1 ON!");
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("BOX 1 ON!");
-  digitalWrite(RELAY1_PIN, LOW);
-  delay(100);
-  digitalWrite(RELAY1_PIN, HIGH);
-  digitalWrite(LED1_PIN, HIGH);
-  delay(1000);
+// ฟังก์ชันเริ่มต้นการควบคุม Relay 1
+void startControlRelay1() {
+  Serial.println("Starting Relay 1 non-blocking...");
+  relayControlStartTime = millis();
+  controlState = 2; // สถานะ Control Relay 1
+  controlStep = 0;
+}
+
+// ฟังก์ชันเริ่มต้นการควบคุม Relay 2
+void startControlRelay2() {
+  Serial.println("Starting Relay 2 non-blocking...");
+  relayControlStartTime = millis();
+  controlState = 3; // สถานะ Control Relay 2
+  controlStep = 0;
+}
+
+// ฟังก์ชันเริ่มต้นการควบคุม Relay 3
+void startControlRelay3() {
+  Serial.println("Starting Relay 3 non-blocking...");
+  relayControlStartTime = millis();
+  controlState = 4; // สถานะ Control Relay 3
+  controlStep = 0;
+}
+
+// ฟังก์ชันจัดการการควบคุมแบบ Non-blocking
+void handleNonBlockingControl() {
+  unsigned long currentMillis = millis();
   
-  // ควบคุม Relay 2 และ LED 2
-  Serial.println("BOX 2 ON!");
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("BOX 2 ON!");
-  digitalWrite(RELAY2_PIN, LOW);
-  delay(100);
-  digitalWrite(RELAY2_PIN, HIGH);
-  digitalWrite(LED2_PIN, HIGH);
-  delay(1000);
-  
-  // ควบคุม Relay 3 และ LED 3
-  Serial.println("BOX 3 ON!");
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("BOX 3 ON!");
-  digitalWrite(RELAY3_PIN, LOW);
-  delay(100);
-  digitalWrite(RELAY3_PIN, HIGH);
-  digitalWrite(LED3_PIN, HIGH);
-  delay(1000);
-  
-  // สั่งให้ LED ทั้งหมดดับลง
-  digitalWrite(LED1_PIN, LOW);
-  digitalWrite(LED2_PIN, LOW);
-  digitalWrite(LED3_PIN, LOW);
-  updateDisplay();
+  switch (controlState) {
+    case 1: // ControlAll
+      switch (controlStep) {
+        case 0:
+          digitalWrite(BUZZER_PIN, HIGH);
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Devices ON");
+          relayControlStartTime = currentMillis;
+          controlStep = 1;
+          break;
+        case 1:
+          if (currentMillis - relayControlStartTime >= 1000) {
+            digitalWrite(BUZZER_PIN, LOW);
+            Serial.println("BOX 1 ON!");
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("BOX 1 ON!");
+            digitalWrite(RELAY1_PIN, LOW);
+            digitalWrite(LED1_PIN, HIGH);
+            relayControlStartTime = currentMillis;
+            controlStep = 2;
+          }
+          break;
+        case 2:
+          if (currentMillis - relayControlStartTime >= 1000) {
+            Serial.println("BOX 2 ON!");
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("BOX 2 ON!");
+            digitalWrite(RELAY2_PIN, LOW);
+            digitalWrite(LED2_PIN, HIGH);
+            relayControlStartTime = currentMillis;
+            controlStep = 3;
+          }
+          break;
+        case 3:
+          if (currentMillis - relayControlStartTime >= 1000) {
+            Serial.println("BOX 3 ON!");
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("BOX 3 ON!");
+            digitalWrite(RELAY3_PIN, LOW);
+            digitalWrite(LED3_PIN, HIGH);
+            relayControlStartTime = currentMillis;
+            controlStep = 4;
+          }
+          break;
+        case 4:
+          if (currentMillis - relayControlStartTime >= 1000) {
+            digitalWrite(LED1_PIN, LOW);
+            digitalWrite(LED2_PIN, LOW);
+            digitalWrite(LED3_PIN, LOW);
+            digitalWrite(RELAY1_PIN, HIGH);
+            digitalWrite(RELAY2_PIN, HIGH);
+            digitalWrite(RELAY3_PIN, HIGH);
+            Serial.println("ControlAll finished.");
+            controlState = 0;
+            updateDisplay();
+          }
+          break;
+      }
+      break;
+
+    case 2: // ControlRelay1
+      if (controlStep == 0) {
+        Serial.println("Scheduled event: BOX 1 ON!");
+        digitalWrite(RELAY1_PIN, LOW);
+        digitalWrite(LED1_PIN, HIGH);
+        shortBuzzerAlert(); // Note: This function still uses delay, but it's short. For a fully non-blocking version, you would also need to handle this with millis().
+        relayControlStartTime = currentMillis;
+        controlStep = 1;
+      }
+      if (currentMillis - relayControlStartTime >= 3000) {
+        digitalWrite(RELAY1_PIN, HIGH);
+        digitalWrite(LED1_PIN, LOW);
+        Serial.println("Relay 1 OFF.");
+        controlState = 0;
+        updateDisplay();
+      }
+      break;
+
+    case 3: // ControlRelay2
+      if (controlStep == 0) {
+        Serial.println("Scheduled event: BOX 2 ON!");
+        digitalWrite(RELAY2_PIN, LOW);
+        digitalWrite(LED2_PIN, HIGH);
+        shortBuzzerAlert();
+        relayControlStartTime = currentMillis;
+        controlStep = 1;
+      }
+      if (currentMillis - relayControlStartTime >= 3000) {
+        digitalWrite(RELAY2_PIN, HIGH);
+        digitalWrite(LED2_PIN, LOW);
+        Serial.println("Relay 2 OFF.");
+        controlState = 0;
+        updateDisplay();
+      }
+      break;
+
+    case 4: // ControlRelay3
+      if (controlStep == 0) {
+        Serial.println("Scheduled event: BOX 3 ON!");
+        digitalWrite(RELAY3_PIN, LOW);
+        digitalWrite(LED3_PIN, HIGH);
+        shortBuzzerAlert();
+        relayControlStartTime = currentMillis;
+        controlStep = 1;
+      }
+      if (currentMillis - relayControlStartTime >= 3000) {
+        digitalWrite(RELAY3_PIN, HIGH);
+        digitalWrite(LED3_PIN, LOW);
+        Serial.println("Relay 3 OFF.");
+        controlState = 0;
+        updateDisplay();
+      }
+      break;
+  }
 }
 
-// ควบคุม Relay 1 ตามกำหนดการ
-void controlRelay1() {
-  Serial.println("Scheduled event: BOX 1 ON!");
-  digitalWrite(RELAY1_PIN, LOW);
-  digitalWrite(LED1_PIN, HIGH);
-
-  shortBuzzerAlert();
-  delay(3000);
-
-  digitalWrite(RELAY1_PIN, HIGH);
-  digitalWrite(LED1_PIN, LOW);
-
-  updateDisplay();
-}
-
-// ควบคุม Relay 2 ตามกำหนดการ
-void controlRelay2() {
-  Serial.println("Scheduled event: BOX 2 ON!");
-  digitalWrite(RELAY2_PIN, LOW);
-  digitalWrite(LED2_PIN, HIGH);
-
-  shortBuzzerAlert();
-  delay(3000);
-
-  digitalWrite(RELAY2_PIN, HIGH);
-  digitalWrite(LED2_PIN, LOW);
-
-  updateDisplay();
-}
-
-// ควบคุม Relay 3 ตามกำหนดการ
-void controlRelay3() {
-  Serial.println("Scheduled event: BOX 3 ON!");
-  digitalWrite(RELAY3_PIN, LOW);
-  digitalWrite(LED3_PIN, HIGH);
-
-  shortBuzzerAlert();
-  delay(3000);
-
-  digitalWrite(RELAY3_PIN, HIGH);
-  digitalWrite(LED3_PIN, LOW);
-
-  updateDisplay();
-}
 
 // ฟังก์ชันสำหรับแสดงตัวเลขที่มี 2 หลักบน LCD
 void print2Digits(int number) {
@@ -407,30 +467,29 @@ void updateDisplay() {
 void resetSystem() {
   Serial.println("System Reset Initiated!");
   
-  // ปิดการทำงานทั้งหมด
-  digitalWrite(RELAY1_PIN, HIGH); // ปิดการทำงานของรีเลย์
+  digitalWrite(RELAY1_PIN, HIGH);
   digitalWrite(RELAY2_PIN, HIGH);
   digitalWrite(RELAY3_PIN, HIGH);
-  digitalWrite(LED1_PIN, LOW); // ปิด LED
+  digitalWrite(LED1_PIN, LOW);
   digitalWrite(LED2_PIN, LOW);
   digitalWrite(LED3_PIN, LOW);
-  digitalWrite(BUZZER_PIN, LOW); // ปิด Buzzer
+  digitalWrite(BUZZER_PIN, LOW);
   
-  // แสดงข้อความรีเซ็ต
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("System Reset!");
   lcd.setCursor(0, 1);
   lcd.print("Please wait...");
-  delay(2000);
+  delay(2000); // This delay is acceptable here since it's a one-time reset action
   
-  // รีเซ็ตตัวแปรสถานะทั้งหมด
   scheduledEventOccurred = false;
   isTouching = false;
   isFunctionExecuted = false;
   isCountingDown = false;
   isBuzzerAlertActive = false;
   isTouchBuzzerActive = false;
+  controlState = 0;
+  controlStep = 0;
 
-  updateDisplay(); // กลับไปแสดงเวลาบนหน้าจอ
+  updateDisplay();
 }
